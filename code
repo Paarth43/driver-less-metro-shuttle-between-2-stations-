@@ -1,0 +1,275 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo gateServo;
+
+// ---------------- Pins ----------------
+const byte IR1 = 2;   // station/end sensor 1
+const byte IR2 = 3;   // station/end sensor 2
+const byte IR3 = 4;   // passenger counter sensor A
+const byte IR4 = 5;   // passenger counter sensor B
+const byte BUZZER = 7;
+const byte SERVO_PIN = 9;
+
+// L298N IN pins 
+const byte IN1 = 10;
+const byte IN2 = 11;
+const byte IN3 = 12;
+const byte IN4 = 13;
+
+// ---------------- Passenger counter ----------------
+int count = 0;
+// 0=idle, 1=IR3 first(entry), 2=IR4 first(exit), 3=wait clear
+byte countState = 0;
+
+// ---------------- Motor state machine ----------------
+// Requested behavior:
+// - If IR1 detects (LOW) -> stop; when IR1 goes HIGH -> run BACKWARD
+// - If IR2 detects (LOW) -> stop; when IR2 goes HIGH -> run FORWARD
+enum MotionState {
+  RUN_FORWARD,
+  RUN_BACKWARD,
+  STOP_BY_IR1,
+  STOP_BY_IR2
+};
+MotionState motionState = RUN_FORWARD;
+
+// ---------------- Servo (door) ----------------
+const int SERVO_CLOSED = 0;
+const int SERVO_OPEN   = 90;
+
+int currentAngle = SERVO_CLOSED;
+int targetAngle  = SERVO_CLOSED;
+
+const unsigned long SERVO_STEP_MS = 35;      // tiny slow movement step
+unsigned long lastServoStepMs = 0;
+
+const unsigned long SERVO_HOLD_MS = 8000;    // 8 seconds at both ends
+unsigned long servoHoldStartMs = 0;
+
+enum DoorState {
+  DOOR_IDLE_CLOSED,
+  DOOR_OPENING,
+  DOOR_HOLD_OPEN,
+  DOOR_CLOSING,
+  DOOR_HOLD_CLOSED
+};
+DoorState doorState = DOOR_IDLE_CLOSED;
+
+// ---------------- Helper functions ----------------
+void showCount(const char* msg) {
+  lcd.setCursor(0, 0); lcd.print("                ");
+  lcd.setCursor(0, 0); lcd.print(msg);
+  lcd.setCursor(0, 1); lcd.print("                ");
+  lcd.setCursor(0, 1); lcd.print(count);
+}
+
+void motorForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void motorBackward() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void motorStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void updateServoStep(unsigned long now) {
+  if (now - lastServoStepMs < SERVO_STEP_MS) return;
+  lastServoStepMs = now;
+
+  if (currentAngle < targetAngle) {
+    currentAngle++;
+    gateServo.write(currentAngle);
+  } else if (currentAngle > targetAngle) {
+    currentAngle--;
+    gateServo.write(currentAngle);
+  }
+}
+
+void startDoorCycleIfNeeded() {
+  if (doorState != DOOR_IDLE_CLOSED) return;
+  doorState = DOOR_OPENING;
+  targetAngle = SERVO_OPEN;
+}
+
+void resetDoorToClosed() {
+  doorState = DOOR_IDLE_CLOSED;
+  targetAngle = SERVO_CLOSED;
+}
+
+void updateDoor(unsigned long now, bool stoppedAtStation) {
+  if (!stoppedAtStation) {
+    resetDoorToClosed();
+    updateServoStep(now); // move toward closed while running
+    return;
+  }
+
+  // station stop: run open/close cycle with 8s hold at both ends
+  startDoorCycleIfNeeded();
+
+  switch (doorState) {
+    case DOOR_IDLE_CLOSED:
+      targetAngle = SERVO_CLOSED;
+      break;
+
+    case DOOR_OPENING:
+      targetAngle = SERVO_OPEN;
+      updateServoStep(now);
+      if (currentAngle >= SERVO_OPEN) {
+        doorState = DOOR_HOLD_OPEN;
+        servoHoldStartMs = now;
+      }
+      break;
+
+    case DOOR_HOLD_OPEN:
+      if (now - servoHoldStartMs >= SERVO_HOLD_MS) {
+        doorState = DOOR_CLOSING;
+        targetAngle = SERVO_CLOSED;
+      }
+      break;
+
+    case DOOR_CLOSING:
+      targetAngle = SERVO_CLOSED;
+      updateServoStep(now);
+      if (currentAngle <= SERVO_CLOSED) {
+        doorState = DOOR_HOLD_CLOSED;
+        servoHoldStartMs = now;
+      }
+      break;
+
+    case DOOR_HOLD_CLOSED:
+      if (now - servoHoldStartMs >= SERVO_HOLD_MS) {
+        doorState = DOOR_OPENING;
+        targetAngle = SERVO_OPEN;
+      }
+      break;
+  }
+}
+
+void setup() {
+  pinMode(IR1, INPUT);
+  pinMode(IR2, INPUT);
+  pinMode(IR3, INPUT);
+  pinMode(IR4, INPUT);
+
+  pinMode(BUZZER, OUTPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  gateServo.attach(SERVO_PIN);
+  gateServo.write(SERVO_CLOSED);
+
+  lcd.init();
+  lcd.backlight();
+  showCount("Passengers:");
+
+  digitalWrite(BUZZER, LOW);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // LOW = detected for typical IR modules
+  bool ir1Low = (digitalRead(IR1) == LOW);
+  bool ir2Low = (digitalRead(IR2) == LOW);
+
+  int s3 = digitalRead(IR3);
+  int s4 = digitalRead(IR4);
+
+  // ======================================================
+  // 1) Motor logic
+  // ======================================================
+  switch (motionState) {
+    case RUN_FORWARD:
+      if (ir1Low) {
+        motorStop();
+        motionState = STOP_BY_IR1;
+      } else if (ir2Low) {
+        motorStop();
+        motionState = STOP_BY_IR2;
+      } else {
+        motorForward();
+      }
+      break;
+
+    case RUN_BACKWARD:
+      if (ir1Low) {
+        motorStop();
+        motionState = STOP_BY_IR1;
+      } else if (ir2Low) {
+        motorStop();
+        motionState = STOP_BY_IR2;
+      } else {
+        motorBackward();
+      }
+      break;
+
+    case STOP_BY_IR1:
+      motorStop();
+      // when IR1 goes HIGH, run backward
+      if (!ir1Low) motionState = RUN_BACKWARD;
+      break;
+
+    case STOP_BY_IR2:
+      motorStop();
+      // when IR2 goes HIGH, run forward
+      if (!ir2Low) motionState = RUN_FORWARD;
+      break;
+  }
+
+  bool stoppedAtStation = (motionState == STOP_BY_IR1 || motionState == STOP_BY_IR2);
+
+  // ======================================================
+  // 2) Door servo logic (8s hold at both ends)
+  // ======================================================
+  updateDoor(now, stoppedAtStation);
+
+  // ======================================================
+  // 3) Passenger counting IR3/IR4 + LCD
+  // ======================================================
+  if (countState == 0) {
+    if (s3 == LOW && s4 == HIGH) countState = 1;      // entry intent
+    else if (s4 == LOW && s3 == HIGH) countState = 2; // exit intent
+  }
+  else if (countState == 1) { // IR3 -> IR4 = entry
+    if (s4 == LOW) {
+      count++;
+      showCount("Boarding...");
+      countState = 3;
+    }
+  }
+  else if (countState == 2) { // IR4 -> IR3 = exit
+    if (s3 == LOW) {
+      if (count > 0) count--;
+      showCount("Exiting...");
+      countState = 3;
+    }
+  }
+  else if (countState == 3) { // wait clear
+    if (s3 == HIGH && s4 == HIGH) {
+      showCount("Passengers:");
+      countState = 0;
+    }
+  }
+
+  // ======================================================
+  // 4) Buzzer rule 
+  // HIGH only when IR1 or IR2 detects, else LOW
+  // ======================================================
+  if (ir1Low || ir2Low) {
+    digitalWrite(BUZZER, HIGH);
+  } else {
+    digitalWrite(BUZZER, LOW);
+  }
+}
